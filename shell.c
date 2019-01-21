@@ -28,6 +28,12 @@
 # define _LARGEFILE_SOURCE 1
 #endif
 
+// add by harris@20190117
+#ifndef SQLITE_ENABLE_PASSWORD
+#define SQLITE_ENABLE_PASSWORD 1
+#include "md5.c"
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -93,6 +99,8 @@ static int enableTimer = 0;
 #if !defined(_WIN32) && !defined(WIN32) && !defined(__OS2__) && !defined(__RTP__) && !defined(_WRS_KERNEL)
 #include <sys/time.h>
 #include <sys/resource.h>
+
+
 
 /* Saved resource information for the beginning of an operation */
 static struct rusage sBegin;
@@ -404,6 +412,10 @@ struct previous_mode_data {
   int colWidth[100];
 };
 
+#ifdef SQLITE_ENABLE_PASSWORD
+#define USER_PASSWD_LEN 256
+#endif
+
 /*
 ** An pointer to an instance of this structure is passed from
 ** the main program to the callback.  This is used to communicate
@@ -433,6 +445,11 @@ struct callback_data {
   const char *zVfs;           /* Name of VFS to use */
   sqlite3_stmt *pStmt;   /* Current statement if any. */
   FILE *pLog;            /* Write log output here */
+#ifdef SQLITE_ENABLE_PASSWORD
+  char username[USER_PASSWD_LEN];
+  char password[USER_PASSWD_LEN];
+  int state; /*0: check system table; 1: check user password*/
+#endif
 };
 
 /*
@@ -2689,6 +2706,10 @@ static const char zOptions[] =
 #ifdef SQLITE_ENABLE_MULTIPLEX
   "   -multiplex           enable the multiplexor VFS\n"
 #endif
+#ifdef SQLITE_ENABLE_PASSWORD
+  "   -u                   set user name to login\n"
+  "   -p                   set password to login\n"
+#endif
 ;
 static void usage(int showDetail){
   fprintf(stderr,
@@ -2803,8 +2824,36 @@ int main(int argc, char **argv){
         fprintf(stderr, "no such VFS: \"%s\"\n", argv[i]);
         exit(1);
       }
-    }
+// add by harris@20190117
+#ifdef SQLITE_ENABLE_PASSWORD
+      } else if (strcmp(argv[i], "-u") == 0) {
+          if (strlen(argv[i+1]) >= USER_PASSWD_LEN ) {
+            fprintf(stderr, "username or password error\n");
+            exit(1);
+          }
+
+          strcpy(data.username, argv[i+1]);
+          if (strlen(data.username) <= 0 || strlen(data.username) >= USER_PASSWD_LEN ) {
+              fprintf(stderr, "username or password error\n");
+              exit(1);
+          }
+          ++i;
+      } else if (strcmp(argv[i], "-p") == 0) {
+          if (strlen(argv[i+1]) >= USER_PASSWD_LEN ) {
+            fprintf(stderr, "username or password error\n");
+            exit(1);
+          }
+
+          strcpy(data.password, argv[i+1]);
+          if (strlen(data.password) <= 0 || strlen(data.password) >= USER_PASSWD_LEN ) {
+              fprintf(stderr, "username or password error\n");
+              exit(1);
+          }
+          ++i;
+      }
+#endif
   }
+
   if( i<argc ){
 #if defined(SQLITE_OS_OS2) && SQLITE_OS_OS2
     data.zDbFilename = (const char *)convertCpPathToUtf8( argv[i++] );
@@ -2921,14 +2970,27 @@ int main(int argc, char **argv){
     }else if( strcmp(z,"-multiplex")==0 ){
       i++;
 #endif
+#ifdef SQLITE_ENABLE_PASSWORD
+    } else if (strcmp(z, "-u") == 0 ) {
+        i++;
+    } else if (strcmp(z, "-p") == 0 ){
+        i++;
+#endif
     }else if( strcmp(z,"-help")==0 || strcmp(z, "--help")==0 ){
       usage(1);
-    }else{
+    } else{
       fprintf(stderr,"%s: Error: unknown option: %s\n", Argv0, z);
       fprintf(stderr,"Use -help for a list of options.\n");
       return 1;
     }
   }
+
+  //add by harris@20190117
+#ifdef SQLITE_ENABLE_PASSWORD
+  if (data.zDbFilename != 0 && strcmp(data.zDbFilename, ":memory:")) {
+      check_user_password(&data);
+  }
+#endif
 
   if( zFirstCmd ){
     /* Run just the command that follows the database name
@@ -2986,3 +3048,103 @@ int main(int argc, char **argv){
   }
   return rc;
 }
+
+#ifdef SQLITE_ENABLE_PASSWORD
+void md5sum(char *data, char * md5_value) {
+    char result[16];
+    int i = 0;
+    memset(result, 0, 16);
+
+    MD5_CTX md5;
+    MD5Init(&md5);
+    MD5Update(&md5, data, strlen((char *)data));
+    MD5Final(&md5, result);
+
+    for (i = 0; i < 16; i ++) {
+        char tmp[2];
+        sprintf(tmp, "%02x", (result[i] & 0xFF));
+        strcat(md5_value, tmp);
+    }
+}
+
+#ifdef SQLITE_ENABLE_PASSWORD
+//This is the callback to handle username and password
+static int shell_callback_password(void *pArg, int nArg, char **azArg, char **azCol, int *aiType){
+    int i = 0;
+    char username[33];
+    char password[33];
+    memset(username, 0, 33);
+    memset(password, 0, 33);
+
+    struct callback_data *p = (struct callback_data*)pArg;
+    md5sum(p->username, username);
+    md5sum(p->password, password);
+    if (strcmp(username, azArg[0]) || strcmp(password, azArg[1])) {
+        fprintf(stderr, "username or password error\n");
+        sqlite3_close(p->db);
+        exit(1);
+    }
+    p->state = 1;
+    return 0;
+}
+#endif
+
+int add_user_password(struct callback_data *data) {
+    int rc = 0;
+    char *zErrMsg = 0;
+    if (strlen(data->username) > 0 && strlen(data->password) > 0) {
+        char sql1[1024];
+        memset(sql1, 0, 1024);
+        char username[33];
+        char password[33];
+        memset(username, 0, 33);
+        memset(password, 0, 33);
+        md5sum(data->username, username);
+        md5sum(data->password, password);
+        sprintf(sql1, "insert into _global_sqlite_system_data(username, password) values(\"%s\", \"%s\");",
+                username, password);
+        rc = shell_exec(data->db, sql1, shell_callback_password, data, &zErrMsg);
+        if (zErrMsg != 0) {
+            fprintf(stderr,"Error: %s\n", zErrMsg);
+            return rc != 0 ? rc : 1;
+        } else if (rc != 0) {
+            fprintf(stderr,"Error: unable to process SQL \"%s\"\n", sql1);
+            return rc;
+        }
+    }
+    return rc;
+}
+
+
+// add by harris@20190117
+int check_user_password(struct callback_data *data) {
+    char *zErrMsg = 0;
+    int rc = 0;
+    open_db(data);
+    data->state = 0;
+    const char *sql = "select username, password from _global_sqlite_system_data";
+    rc = shell_exec(data->db, sql, shell_callback_password, data, &zErrMsg);
+    if (zErrMsg != 0 && strstr(zErrMsg, "no such table")) {
+        if (strlen(data->username) <= 0 || strlen(data->password) <= 0) {
+            return 0;
+        }
+        sql = "CREATE TABLE _global_sqlite_system_data(username text, password text);";
+        rc = shell_exec(data->db, sql, shell_callback_password, data, &zErrMsg);
+        if (zErrMsg != 0) {
+            fprintf(stderr,"Error: %s\n", zErrMsg);
+            return rc != 0 ? rc : 1;
+        } else if (rc != 0) {
+            fprintf(stderr,"Error: unable to process SQL \"%s\"\n", sql);
+            return rc;
+        }
+    }
+
+    if (data->state == 0 && strlen(data->username) > 0 && strlen(data->password) > 0) {
+        if (add_user_password(data)) {
+            fprintf(stderr, "add user password error\n"); 
+            return 1;
+        }
+    }
+    return rc;
+}
+#endif
