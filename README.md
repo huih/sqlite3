@@ -13,3 +13,7 @@ and run ./test will generate encrypt.db
 use vim open the encrypt.db will see encrypt data. 
 and use sqlite3 command to operation the db, will get "Error: unsupported file format" error.
 
+support connect use user name and password. add -u and -p parameter to point username and password.
+
+every db will create _global_sqlite_system_data table to save user name and password, and user name and password use md5 encoded.
+
